@@ -17,6 +17,8 @@
 Receives documents from an OplogThread and takes the appropriate actions on
 Elasticsearch.
 """
+import os
+import sys
 import base64
 import logging
 import threading
@@ -52,6 +54,18 @@ from mongo_connector.util import exception_wrapper, retry_until_ok
 from mongo_connector.doc_managers.doc_manager_base import DocManagerBase
 from mongo_connector.doc_managers.formatters import DefaultDocumentFormatter
 
+cwd = os.getcwd()
+sys.path.insert( 1,  cwd )
+import json
+import datetime
+import dpath.util
+try:
+    with open('config.json') as config_file:
+        CONFIG = json.load(config_file)
+except FileNotFoundError:
+    print('config.json file not found')
+    sys.exit(1)
+    
 _HAS_AWS = True
 try:
     from boto3 import session
@@ -111,6 +125,12 @@ def create_aws_auth(aws_args):
         aws_session.region_name or DEFAULT_AWS_REGION,
         "es",
     )
+
+
+def date_encoder( obj, encoder=json.JSONEncoder() ):
+    if isinstance(obj, datetime.datetime):
+        return obj.strftime( '%Y-%m-%d %H:%M:%S' )
+    return encoder.default( obj )
 
 
 class AutoCommiter(threading.Thread):
@@ -223,11 +243,46 @@ class DocManager(DocManagerBase):
         )
         self.auto_commiter.start()
 
+    #def _index_and_mapping(self, namespace):
+    #    """Helper method for getting the index and type from a namespace."""
+    #    index, doc_type = namespace.split(".", 1)
+    #    return index.lower(), doc_type
+
     def _index_and_mapping(self, namespace):
         """Helper method for getting the index and type from a namespace."""
-        index, doc_type = namespace.split(".", 1)
-        return index.lower(), doc_type
+        return namespace.lower(), "_doc"
 
+    def _cast_field_types(self, field_types, doc):
+        translated = {}
+        types = {
+            'string': str,
+            'boolean': bool,
+            'datetime': datetime.datetime,
+            'float': float,
+            'integer': int
+        }
+        doc = json.loads( json.dumps( doc, default=date_encoder ) )
+        for k, c in field_types.items():
+            try:
+                value = dpath.util.get(doc, k, separator='.')
+                if isinstance( value, types[c['type']] ):
+                    continue
+                else:
+                    if c['type'] == 'datetime':
+                        t_value = datetime.datetime.strptime(
+                            value, '%Y-%m-%d %H:%M:%S')
+                    elif c['type'] == 'boolean':
+                        if value in [1, '1', 'true', 'True', 'TRUE']:
+                            t_value = True
+                        else:
+                            t_value = False
+                    else:
+                        t_value = types[c['type']](value)
+            except:
+                t_value = None
+            dpath.util.set(doc, k, t_value, separator='.')
+        return doc
+    
     def stop(self):
         """Stop the auto-commit thread."""
         self.auto_commiter.join()
@@ -321,9 +376,15 @@ class DocManager(DocManagerBase):
     def upsert(self, doc, namespace, timestamp, update_spec=None):
         """Insert a document into Elasticsearch."""
         index, doc_type = self._index_and_mapping(namespace)
+        
         # No need to duplicate '_id' in source document
         doc_id = str(doc.pop("_id"))
         metadata = {"ns": namespace, "_ts": timestamp}
+
+        field_types = CONFIG.get('namespaces', {})\
+            .get(index, {}).get('_fieldConfig')
+        if field_types:
+            doc = self._cast_field_types(field_types, doc)
 
         # Index the source document, using lowercase namespace as index name.
         action = {
@@ -353,9 +414,16 @@ class DocManager(DocManagerBase):
 
         def docs_to_upsert():
             doc = None
+            field_types = CONFIG.get('namespaces', {})\
+                .get(index, {}).get('_fieldConfig')
+            
             for doc in docs:
                 # Remove metadata and redundant _id
                 index, doc_type = self._index_and_mapping(namespace)
+
+                if field_types:
+                    doc = self._cast_field_types(field_types, doc)
+                
                 doc_id = str(doc.pop("_id"))
                 document_action = {
                     "_index": index,
@@ -405,6 +473,11 @@ class DocManager(DocManagerBase):
         doc_id = str(doc.pop("_id"))
         index, doc_type = self._index_and_mapping(namespace)
 
+        field_types = CONFIG.get('namespaces', {})\
+            .get(index, {}).get('_fieldConfig')
+        if field_types:
+            doc = self._cast_field_types(field_types, doc)
+
         # make sure that elasticsearch treats it like a file
         if not self.has_attachment_mapping:
             body = {"properties": {self.attachment_field: {"type": "attachment"}}}
@@ -412,7 +485,7 @@ class DocManager(DocManagerBase):
             self.has_attachment_mapping = True
 
         metadata = {"ns": namespace, "_ts": timestamp}
-
+        
         doc = self._formatter.format_document(doc)
         doc[self.attachment_field] = base64.b64encode(f.read()).decode()
 
