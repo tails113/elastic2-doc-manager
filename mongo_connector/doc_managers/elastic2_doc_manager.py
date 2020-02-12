@@ -58,7 +58,6 @@ cwd = os.getcwd()
 sys.path.insert( 1,  cwd )
 import json
 import datetime
-import dpath.util
 try:
     with open('config.json') as config_file:
         CONFIG = json.load(config_file)
@@ -137,6 +136,21 @@ def quiddi_encoder( obj, encoder=json.JSONEncoder() ):
     return encoder.default( obj )
 
 
+def obj_get(obj, path):     
+    paths = path.split(".")
+    data = obj
+    for i in range(0,len(paths)):
+        data = data[paths[i]]
+    return data
+
+
+def obj_set(obj, path, value):
+    paths = path.split(".")
+    for key in paths[:-1]:
+        obj = obj.setdefault(key, {})
+    obj[paths[-1]] = value
+
+    
 class AutoCommiter(threading.Thread):
     """Thread that periodically sends buffered operations to Elastic.
 
@@ -270,15 +284,13 @@ class DocManager(DocManagerBase):
                 )
 
     def _new_fields(self, field_types, doc, doc_id):
-        doc = json.loads( json.dumps( doc, default=quiddi_encoder ) )
-
         for k, c in field_types.items():
             try:
                 if c['type'] == '_id':
-                    dpath.util.new(doc, k, doc_id, separator='.')
+                    obj_set(doc, k, doc_id)
                 elif c['type'] == 'dupe':
-                    value = dpath.util.get(doc, c['path'], separator='.')
-                    dpath.util.new(doc, k, value, separator='.')
+                    value = obj_get(doc, c['path'])
+                    obj_set(doc, k, value)
             except Exception as e:
                 print('map fields error occured key: {}, reason: {}'.format(k, e))
         return doc
@@ -289,58 +301,14 @@ class DocManager(DocManagerBase):
             'text': str,
             'boolean': bool,
             'float': float,
-            'integer': int
-        }
-
-        doc = json.loads( json.dumps( doc, default=quiddi_encoder ) )
-        
-        for k, c in field_types.items():
-            try:
-                value = dpath.util.get(doc, k, separator='.')
-                if value == None:
-                    continue
-                elif c['type'] == 'date':
-                    continue
-                    #import pdb; pdb.set_trace()
-                    #t_value = datetime.datetime.strptime(
-                    #    value, '%Y-%m-%d %H:%M:%S')
-                elif isinstance( value, types[c['type']] ):
-                    continue
-                else:
-                    if c['type'] == 'boolean':
-                        if value in [1, '1', 'true', 'True', 'TRUE']:
-                            t_value = True
-                        else:
-                            t_value = False
-                    else:
-                        t_value = types[c['type']](value)
-                dpath.util.set(doc, k, t_value, separator='.')
-            except Exception as e:
-                print('cast fields error occured key: {}, reason: {}'.format(k, e))
-        return doc
-                
-    def _oldcast_field_types(self, field_types, doc):
-        types = {
-            'keyword': str,
-            'text': str,
-            'boolean': bool,
-            'float': float,
             'integer': int,
             'date': datetime.datetime
         }
 
-        #doc = json.loads( json.dumps( doc, default=quiddi_encoder ) )
-        
         for k, c in field_types.items():
             try:
-                #import pdb; pdb.set_trace()
-                #value = dpath.util.get(doc, k, separator='.')
-                if value == None:
-                    continue
-                elif c['type'] == 'date':
-                    t_value = datetime.datetime.strptime(
-                        value, '%Y-%m-%d %H:%M:%S')
-                elif isinstance( value, types[c['type']] ):
+                value = obj_get(doc, k)
+                if ( value == None or isinstance( value, types[c['type']] ) ):
                     continue
                 else:
                     if c['type'] == 'boolean':
@@ -348,14 +316,16 @@ class DocManager(DocManagerBase):
                             t_value = True
                         else:
                             t_value = False
+                    elif c['type'] == 'date':
+                        t_value = datetime.datetime.strptime(
+                            value, '%Y-%m-%d %H:%M:%S')    
                     else:
                         t_value = types[c['type']](value)
+                obj_set(doc, k, t_value)
             except Exception as e:
-                print('error occured key: {}, reason: {}'.format(k, e))
-                t_value = None
-            dpath.util.set(doc, k, t_value, separator='.')
+                print('cast fields error occured key: {}, reason: {}'.format(k, e))
         return doc
-    
+                
     def stop(self):
         """Stop the auto-commit thread."""
         self.auto_commiter.join()
@@ -497,6 +467,10 @@ class DocManager(DocManagerBase):
                 index, doc_type = self._index_and_mapping(namespace)
 
                 #import pdb; pdb.set_trace()
+                new_fields = CONFIG.get('_newfields', {}).get(namespace, {})
+                if new_fields:
+                    doc = self._new_fields(new_fields, doc, doc_id)
+
                 field_types = CONFIG.get('_mapping', {}).get(index, {})
                 if field_types:
                     doc = self._cast_field_types(field_types, doc)
@@ -552,6 +526,10 @@ class DocManager(DocManagerBase):
         index, doc_type = self._index_and_mapping(namespace)
 
         #import pdb; pdb.set_trace()
+        new_fields = CONFIG.get('_newfields', {}).get(namespace, {})
+        if new_fields:
+            doc = self._new_fields(new_fields, doc, doc_id)
+
         field_types = CONFIG.get('_mapping', {}).get(index, {})
         if field_types:
             doc = self._cast_field_types(field_types, doc)
