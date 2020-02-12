@@ -127,7 +127,11 @@ def create_aws_auth(aws_args):
     )
 
 
-def date_encoder( obj, encoder=json.JSONEncoder() ):
+def quiddi_encoder( obj, encoder=json.JSONEncoder() ):
+    import bson
+    from bson.objectid import ObjectId
+    if isinstance( obj, ObjectId ):
+        return str( obj )
     if isinstance(obj, datetime.datetime):
         return obj.strftime( '%Y-%m-%d %H:%M:%S' )
     return encoder.default( obj )
@@ -220,6 +224,8 @@ class DocManager(DocManagerBase):
             url = [url]
         self.elastic = Elasticsearch(hosts=url, **client_options)
 
+        self._create_indexes()
+        
         self._formatter = DefaultDocumentFormatter()
         self.BulkBuffer = BulkBuffer(self)
 
@@ -252,33 +258,100 @@ class DocManager(DocManagerBase):
         """Helper method for getting the index and type from a namespace."""
         return namespace.lower(), "_doc"
 
+    def _create_indexes(self):
+        for key, value in CONFIG['namespaces'].items():
+            index_name = value.get('rename', key)
+            if not self.elastic.indices.exists(index_name):
+                config = CONFIG.get('_mapping', {})\
+                    .get(index_name, {})
+                self.elastic.indices.create(
+                    index_name,
+                    body={'mappings': { 'properties': config } }
+                )
+
+    def _new_fields(self, field_types, doc, doc_id):
+        doc = json.loads( json.dumps( doc, default=quiddi_encoder ) )
+
+        for k, c in field_types.items():
+            try:
+                if c['type'] == '_id':
+                    dpath.util.new(doc, k, doc_id, separator='.')
+                elif c['type'] == 'dupe':
+                    value = dpath.util.get(doc, c['path'], separator='.')
+                    dpath.util.new(doc, k, value, separator='.')
+            except Exception as e:
+                print('map fields error occured key: {}, reason: {}'.format(k, e))
+        return doc
+                
     def _cast_field_types(self, field_types, doc):
-        translated = {}
         types = {
-            'string': str,
+            'keyword': str,
+            'text': str,
             'boolean': bool,
-            'datetime': datetime.datetime,
             'float': float,
             'integer': int
         }
-        doc = json.loads( json.dumps( doc, default=date_encoder ) )
+
+        doc = json.loads( json.dumps( doc, default=quiddi_encoder ) )
+        
         for k, c in field_types.items():
             try:
                 value = dpath.util.get(doc, k, separator='.')
-                if isinstance( value, types[c['type']] ):
+                if value == None:
+                    continue
+                elif c['type'] == 'date':
+                    continue
+                    #import pdb; pdb.set_trace()
+                    #t_value = datetime.datetime.strptime(
+                    #    value, '%Y-%m-%d %H:%M:%S')
+                elif isinstance( value, types[c['type']] ):
                     continue
                 else:
-                    if c['type'] == 'datetime':
-                        t_value = datetime.datetime.strptime(
-                            value, '%Y-%m-%d %H:%M:%S')
-                    elif c['type'] == 'boolean':
+                    if c['type'] == 'boolean':
                         if value in [1, '1', 'true', 'True', 'TRUE']:
                             t_value = True
                         else:
                             t_value = False
                     else:
                         t_value = types[c['type']](value)
-            except:
+                dpath.util.set(doc, k, t_value, separator='.')
+            except Exception as e:
+                print('cast fields error occured key: {}, reason: {}'.format(k, e))
+        return doc
+                
+    def _oldcast_field_types(self, field_types, doc):
+        types = {
+            'keyword': str,
+            'text': str,
+            'boolean': bool,
+            'float': float,
+            'integer': int,
+            'date': datetime.datetime
+        }
+
+        #doc = json.loads( json.dumps( doc, default=quiddi_encoder ) )
+        
+        for k, c in field_types.items():
+            try:
+                #import pdb; pdb.set_trace()
+                #value = dpath.util.get(doc, k, separator='.')
+                if value == None:
+                    continue
+                elif c['type'] == 'date':
+                    t_value = datetime.datetime.strptime(
+                        value, '%Y-%m-%d %H:%M:%S')
+                elif isinstance( value, types[c['type']] ):
+                    continue
+                else:
+                    if c['type'] == 'boolean':
+                        if value in [1, '1', 'true', 'True', 'TRUE']:
+                            t_value = True
+                        else:
+                            t_value = False
+                    else:
+                        t_value = types[c['type']](value)
+            except Exception as e:
+                print('error occured key: {}, reason: {}'.format(k, e))
                 t_value = None
             dpath.util.set(doc, k, t_value, separator='.')
         return doc
@@ -375,14 +448,18 @@ class DocManager(DocManagerBase):
     @wrap_exceptions
     def upsert(self, doc, namespace, timestamp, update_spec=None):
         """Insert a document into Elasticsearch."""
+
         index, doc_type = self._index_and_mapping(namespace)
         
         # No need to duplicate '_id' in source document
         doc_id = str(doc.pop("_id"))
         metadata = {"ns": namespace, "_ts": timestamp}
 
-        field_types = CONFIG.get('namespaces', {})\
-            .get(index, {}).get('_fieldConfig')
+        new_fields = CONFIG.get('_newfields', {}).get(namespace, {})
+        if new_fields:
+            doc = self._new_fields(new_fields, doc, doc_id)
+        
+        field_types = CONFIG.get('_mapping', {}).get(namespace, {})
         if field_types:
             doc = self._cast_field_types(field_types, doc)
 
@@ -414,13 +491,13 @@ class DocManager(DocManagerBase):
 
         def docs_to_upsert():
             doc = None
-            field_types = CONFIG.get('namespaces', {})\
-                .get(index, {}).get('_fieldConfig')
             
             for doc in docs:
                 # Remove metadata and redundant _id
                 index, doc_type = self._index_and_mapping(namespace)
 
+                #import pdb; pdb.set_trace()
+                field_types = CONFIG.get('_mapping', {}).get(index, {})
                 if field_types:
                     doc = self._cast_field_types(field_types, doc)
                 
@@ -469,12 +546,13 @@ class DocManager(DocManagerBase):
 
     @wrap_exceptions
     def insert_file(self, f, namespace, timestamp):
+
         doc = f.get_metadata()
         doc_id = str(doc.pop("_id"))
         index, doc_type = self._index_and_mapping(namespace)
 
-        field_types = CONFIG.get('namespaces', {})\
-            .get(index, {}).get('_fieldConfig')
+        #import pdb; pdb.set_trace()
+        field_types = CONFIG.get('_mapping', {}).get(index, {})
         if field_types:
             doc = self._cast_field_types(field_types, doc)
 
@@ -509,6 +587,7 @@ class DocManager(DocManagerBase):
     @wrap_exceptions
     def remove(self, document_id, namespace, timestamp):
         """Remove a document from Elasticsearch."""
+
         index, doc_type = self._index_and_mapping(namespace)
 
         action = {
@@ -530,6 +609,7 @@ class DocManager(DocManagerBase):
     @wrap_exceptions
     def _stream_search(self, *args, **kwargs):
         """Helper method for iterating over ES search results."""
+
         for hit in scan(
             self.elastic, query=kwargs.pop("body", None), scroll="10m", **kwargs
         ):
